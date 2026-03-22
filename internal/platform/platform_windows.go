@@ -7,25 +7,35 @@ import (
 	"os/exec"
 	"strings"
 
+	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
+const inetKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+const snapshotKey = inetKey + `\MitmSnapshot`
+
+// WinINet option constants for InternetSetOption.
+// https://learn.microsoft.com/en-us/windows/win32/wininet/option-flags
 const (
-	inetKey = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	// WinINet broadcast message — tells IE/Edge/Chrome to pick up new proxy settings.
-	winINetChanged = "wininet.dll,SetInternetExplorerProxy"
+	internetOptionSettingsChanged = 39
+	internetOptionRefresh         = 37
+)
+
+var (
+	wininet               = windows.NewLazySystemDLL("wininet.dll")
+	procInternetSetOption = wininet.NewProc("InternetSetOptionW")
 )
 
 // ── System proxy ─────────────────────────────────────────────────────────────
 
 func setSystemProxy(cfg ProxyConfig) error {
-	k, err := registry.OpenKey(registry.CURRENT_USER, inetKey, registry.SET_VALUE|registry.QUERY_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, inetKey,
+		registry.SET_VALUE|registry.QUERY_VALUE)
 	if err != nil {
 		return fmt.Errorf("platform: open registry key: %w", err)
 	}
 	defer k.Close()
 
-	// Save the current state so ClearSystemProxy can restore it.
 	if err := saveSnapshot(k); err != nil {
 		return err
 	}
@@ -33,7 +43,6 @@ func setSystemProxy(cfg ProxyConfig) error {
 	if err := k.SetStringValue("ProxyServer", cfg.Server()); err != nil {
 		return fmt.Errorf("platform: set ProxyServer: %w", err)
 	}
-	// Override: apply proxy to all protocols except localhost.
 	if err := k.SetStringValue("ProxyOverride", "<local>"); err != nil {
 		return fmt.Errorf("platform: set ProxyOverride: %w", err)
 	}
@@ -47,14 +56,15 @@ func setSystemProxy(cfg ProxyConfig) error {
 }
 
 func clearSystemProxy() error {
-	k, err := registry.OpenKey(registry.CURRENT_USER, inetKey, registry.SET_VALUE|registry.QUERY_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, inetKey,
+		registry.SET_VALUE|registry.QUERY_VALUE)
 	if err != nil {
 		return fmt.Errorf("platform: open registry key: %w", err)
 	}
 	defer k.Close()
 
 	if err := restoreSnapshot(k); err != nil {
-		// No snapshot — just disable.
+		// No snapshot saved — just disable.
 		_ = k.SetDWordValue("ProxyEnable", 0)
 	}
 
@@ -63,78 +73,81 @@ func clearSystemProxy() error {
 	return nil
 }
 
-// notifyWinINet broadcasts the settings change so all running browsers
-// (Chrome, Edge, IE) pick it up without needing a restart.
+// notifyWinINet tells WinINet (and therefore Chrome, Edge, etc.) to re-read
+// the proxy settings from the registry immediately, without a browser restart.
+//
+// The correct API is InternetSetOptionW with:
+//   - INTERNET_OPTION_SETTINGS_CHANGED (39) — signals that settings changed
+//   - INTERNET_OPTION_REFRESH           (37) — forces a refresh from registry
+//
+// Both calls use hInternet=0 (NULL), which applies the notification globally.
+// This replaces the broken rundll32 approach from the previous version.
 func notifyWinINet() {
-	// rundll32 url.dll,FileProtocolHandler is the canonical way to trigger the
-	// WinINet change notification from a non-GUI process.
-	_ = exec.Command("rundll32.exe", winINetChanged).Run()
+	// NULL handle means "apply to all sessions".
+	procInternetSetOption.Call(0, internetOptionSettingsChanged, 0, 0)
+	procInternetSetOption.Call(0, internetOptionRefresh, 0, 0)
 }
 
-// ── Snapshot helpers — save/restore previous proxy state ────────────────────
-
-// We persist the previous values as registry strings under a "MitmSnapshot"
-// key so that ClearSystemProxy can restore exactly what was there before.
-
-const snapshotKey = inetKey + `\MitmSnapshot`
+// ── Snapshot helpers ──────────────────────────────────────────────────────────
 
 func saveSnapshot(k registry.Key) error {
-	snap, _, err := registry.CreateKey(registry.CURRENT_USER, snapshotKey, registry.SET_VALUE)
+	snap, _, err := registry.CreateKey(registry.CURRENT_USER, snapshotKey,
+		registry.SET_VALUE)
 	if err != nil {
 		return fmt.Errorf("platform: create snapshot key: %w", err)
 	}
 	defer snap.Close()
 
-	wasEnabled, _, _ := k.GetIntegerValue("ProxyEnable")
-	prevServer, _, _ := k.GetStringValue("ProxyServer")
-	prevOverride, _, _ := k.GetStringValue("ProxyOverride")
+	enabled, _, _ := k.GetIntegerValue("ProxyEnable")
+	server, _, _ := k.GetStringValue("ProxyServer")
+	override, _, _ := k.GetStringValue("ProxyOverride")
 
-	_ = snap.SetDWordValue("ProxyEnable", uint32(wasEnabled))
-	_ = snap.SetStringValue("ProxyServer", prevServer)
-	_ = snap.SetStringValue("ProxyOverride", prevOverride)
+	_ = snap.SetDWordValue("ProxyEnable", uint32(enabled))
+	_ = snap.SetStringValue("ProxyServer", server)
+	_ = snap.SetStringValue("ProxyOverride", override)
 	return nil
 }
 
 func restoreSnapshot(k registry.Key) error {
-	snap, err := registry.OpenKey(registry.CURRENT_USER, snapshotKey, registry.QUERY_VALUE)
+	snap, err := registry.OpenKey(registry.CURRENT_USER, snapshotKey,
+		registry.QUERY_VALUE)
 	if err != nil {
 		return fmt.Errorf("platform: no snapshot found")
 	}
 	defer snap.Close()
 
-	wasEnabled, _, _ := snap.GetIntegerValue("ProxyEnable")
-	prevServer, _, _ := snap.GetStringValue("ProxyServer")
-	prevOverride, _, _ := snap.GetStringValue("ProxyOverride")
+	enabled, _, _ := snap.GetIntegerValue("ProxyEnable")
+	server, _, _ := snap.GetStringValue("ProxyServer")
+	override, _, _ := snap.GetStringValue("ProxyOverride")
 
-	_ = k.SetDWordValue("ProxyEnable", uint32(wasEnabled))
-	_ = k.SetStringValue("ProxyServer", prevServer)
-	_ = k.SetStringValue("ProxyOverride", prevOverride)
+	_ = k.SetDWordValue("ProxyEnable", uint32(enabled))
+	_ = k.SetStringValue("ProxyServer", server)
+	_ = k.SetStringValue("ProxyOverride", override)
 
-	// Clean up the snapshot key.
 	_ = registry.DeleteKey(registry.CURRENT_USER, snapshotKey)
 	return nil
 }
 
-// ── CA trust ─────────────────────────────────────────────────────────────────
+// ── CA trust ──────────────────────────────────────────────────────────────────
 
 func trustCA(caCertPath string) error {
-	// certutil is built into every Windows version since Vista.
-	// -addstore Root  → adds to the machine-wide "Trusted Root CAs" store.
-	// Running without elevation adds only to the current-user store, which is
-	// sufficient for Chrome/Edge/IE. Firefox uses its own store (see below).
+	// certutil -addstore -user Root <path>
+	// -user  → writes to HKCU (current user store), no elevation needed.
+	// Chrome, Edge and all WinINet-based apps trust the current-user Root store.
 	cmd := exec.Command("certutil", "-addstore", "-user", "Root", caCertPath)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("platform: certutil: %w\n%s", err, out)
 	}
-	fmt.Println("[ca] Root certificate trusted in Windows certificate store (current user)")
-	fmt.Println("[ca] Note: Firefox uses its own trust store — see --install-ca for instructions")
+	fmt.Println("[ca] Root certificate trusted (Windows current-user Root store)")
+	fmt.Println("[ca] Note: Firefox manages its own trust store independently.")
+	fmt.Println("[ca] To trust in Firefox: about:preferences → Certificates → Import")
 	return nil
 }
 
 func isTrusted(commonName string) (bool, error) {
-	// certutil -verifystore Root <CN> exits 0 if found.
-	out, err := exec.Command("certutil", "-verifystore", "-user", "Root", commonName).CombinedOutput()
+	out, err := exec.Command("certutil", "-verifystore", "-user", "Root",
+		commonName).CombinedOutput()
 	if err != nil {
 		return false, nil
 	}
