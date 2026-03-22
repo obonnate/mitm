@@ -1,28 +1,34 @@
-# Angular specific
-/dist/
-/out-tsc/
-/tmp/
-/coverage/
-/e2e/test-output/
-/.angular/
+# Go
+bin/
+vendor/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go build cache
+/go-build/
+
+# Angular / Node
+node_modules/
+dist/
+tmp/
+temp/
+npm-debug.log
+yarn-error.log
+
+# Angular build artifacts
 .angular/
+.angular/cache/
 
-# Node modules and dependency files
-/node_modules/
-/package-lock.json
-/yarn.lock
+# IDEs
+.vscode/
+.idea/
+*.swp
 
-# Environment files
-/.env
-
-# Angular CLI and build artefacts
-/.angular-cli.json
-/.ng/
-
-# TypeScript cache
-*.tsbuildinfo
-
-# Logs
-npm-debug.log*
-yarn-debug.log*
-yarn-error.log*
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,13 @@
+{
+  "/api": {
+    "target": "http://localhost:9000",
+    "secure": false,
+    "logLevel": "info"
+  },
+  "/ws": {
+    "target": "ws://localhost:9000",
+    "secure": false,
+    "ws": true,
+    "logLevel": "info"
+  }
+}
